@@ -1,0 +1,7 @@
+# Secrets e arquivos locais sensiveis
+.env
+*.pem
+*.key
+*.tfvars
+reports/
+.DS_Store

@@ -1,0 +1,38 @@
+# Override de producao para EC2 (usado em conjunto com API-DSM-4-INFRA/docker-compose.yml):
+#   docker compose --project-name vulture --env-file .env -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+#
+# Mantem backend (127.0.0.1:3000) e frontend (127.0.0.1:3010) isolados no loopback,
+# expondo apenas o proxy reverso Nginx (porta 80) e o broker MQTT (porta 1883,
+# controlada pelo Security Group da EC2).
+
+x-aws-logging: &aws-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  redis:
+    logging: *aws-logging
+
+  mosquitto:
+    ports: !override
+      - "0.0.0.0:${MQTT_PORT:-1883}:1883"
+    logging: *aws-logging
+
+  backend:
+    logging: *aws-logging
+
+  recepcao:
+    logging: *aws-logging
+
+  persistencia:
+    logging: *aws-logging
+
+  frontend:
+    logging: *aws-logging
+
+  nginx:
+    ports:
+      - "0.0.0.0:80:80"
+    logging: *aws-logging
