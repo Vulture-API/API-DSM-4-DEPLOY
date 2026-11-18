@@ -88,7 +88,7 @@ if [ -f "${DEPLOY_DIR}/aws/docker-compose.aws.yml" ]; then
 fi
 
 echo "==> [1.5/5] Garantindo certificado HTTPS (Let's Encrypt) e configuracao do Nginx..."
-PUBLIC_DOMAIN="$(get_env_val "PUBLIC_DOMAIN")"
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-$(get_env_val "PUBLIC_DOMAIN")}"
 if [ -z "${PUBLIC_DOMAIN}" ]; then
   IMDS_TOKEN="$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)"
   PUBLIC_IP="$(curl -s -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
