@@ -96,7 +96,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --comment "GitHub Actions API-DSM-4-DEPLOY (${GITHUB_SHA::7})" \
             --timeout-seconds 900 \
-            --parameters 'commands=["sudo /opt/vulture/scripts/deploy-ec2.sh"]' \
+            --parameters 'commands=["sudo git -C /opt/vulture/API-DSM-4-DEPLOY fetch -q origin main && sudo git -C /opt/vulture/API-DSM-4-DEPLOY reset -q --hard origin/main && sudo install -m 750 /opt/vulture/API-DSM-4-DEPLOY/scripts/deploy-ec2.sh /opt/vulture/scripts/deploy-ec2.sh && sudo PUBLIC_DOMAIN=${{ vars.PUBLIC_DOMAIN }} /opt/vulture/scripts/deploy-ec2.sh"]' \
             --query "Command.CommandId" \
             --output text)
           echo "CommandId: ${COMMAND_ID}"
@@ -165,7 +165,7 @@ jobs:
 
           ssh -i ~/.ssh/deploy_key -p "${SSH_PORT}" ${STRICT_OPT} \
             "${SSH_USER}@${SSH_HOST}" \
-            "sudo /opt/vulture/scripts/deploy-ec2.sh"
+            "sudo git -C /opt/vulture/API-DSM-4-DEPLOY fetch -q origin main && sudo git -C /opt/vulture/API-DSM-4-DEPLOY reset -q --hard origin/main && sudo install -m 750 /opt/vulture/API-DSM-4-DEPLOY/scripts/deploy-ec2.sh /opt/vulture/scripts/deploy-ec2.sh && sudo PUBLIC_DOMAIN=${{ vars.PUBLIC_DOMAIN }} /opt/vulture/scripts/deploy-ec2.sh"
 
   smoke-test-external:
     name: Smoke Test Externo Pos-Deploy
