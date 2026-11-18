@@ -80,12 +80,6 @@ Resources:
           ToPort: 1883
           CidrIp: !Ref AllowedMqttCidr
           Description: MQTT telemetry ingestion port for weather stations
-      SecurityGroupEgress:
-        - IpProtocol: -1
-          FromPort: -1
-          ToPort: -1
-          CidrIp: 0.0.0.0/0
-          Description: Allow outbound traffic for package updates, GitHub, SSM, and external PostgreSQL
       Tags:
         - Key: Name
           Value: !Sub "${EnvironmentName}-ec2-sg"
