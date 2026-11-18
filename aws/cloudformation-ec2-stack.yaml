@@ -219,6 +219,7 @@ Resources:
               StringLike:
                 token.actions.githubusercontent.com:sub:
                   - !Sub "repo:${GitHubOrg}/${GitHubDeployRepo}:*"
+                  - !Sub "repo:${GitHubOrg}@*/${GitHubDeployRepo}@*:*"
       Policies:
         - PolicyName: !Sub "${EnvironmentName}-ssm-deploy-policy"
           PolicyDocument:

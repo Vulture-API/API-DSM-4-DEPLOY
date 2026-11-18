@@ -14,7 +14,8 @@
         },
         "StringLike": {
           "token.actions.githubusercontent.com:sub": [
-            "repo:Vulture-API/API-DSM-4-DEPLOY:*"
+            "repo:Vulture-API/API-DSM-4-DEPLOY:*",
+            "repo:Vulture-API@324885289/API-DSM-4-DEPLOY@1462724427:*"
           ]
         }
       }
