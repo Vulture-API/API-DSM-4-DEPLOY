@@ -33,6 +33,10 @@ services:
     logging: *aws-logging
 
   nginx:
-    ports:
+    ports: !override
       - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    volumes: !override
+      - ./nginx/nginx.aws.generated.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     logging: *aws-logging

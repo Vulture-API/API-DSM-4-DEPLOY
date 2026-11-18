@@ -82,6 +82,48 @@ fi
 echo "Revisao INFRA em deploy: $(git rev-parse --short HEAD)"
 git submodule status
 
+DEPLOY_DIR="${DEPLOY_DIR:-${VULTURE_BASE_DIR}/API-DSM-4-DEPLOY}"
+if [ -f "${DEPLOY_DIR}/aws/docker-compose.aws.yml" ]; then
+  cp "${DEPLOY_DIR}/aws/docker-compose.aws.yml" "${AWS_OVERRIDE_FILE}"
+fi
+
+echo "==> [1.5/5] Garantindo certificado HTTPS (Let's Encrypt) e configuracao do Nginx..."
+PUBLIC_DOMAIN="$(get_env_val "PUBLIC_DOMAIN")"
+if [ -z "${PUBLIC_DOMAIN}" ]; then
+  IMDS_TOKEN="$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)"
+  PUBLIC_IP="$(curl -s -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
+  if [ -z "${PUBLIC_IP}" ]; then
+    echo "Erro: nao foi possivel descobrir o IP publico. Defina PUBLIC_DOMAIN em ${ENV_FILE}." >&2
+    exit 1
+  fi
+  PUBLIC_DOMAIN="${PUBLIC_IP//./-}.sslip.io"
+fi
+CERTBOT_EMAIL="$(get_env_val "CERTBOT_EMAIL")"
+echo "Dominio publico: ${PUBLIC_DOMAIN}"
+
+if ! command -v certbot >/dev/null 2>&1; then
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot
+fi
+
+NGINX_CONTAINER="${COMPOSE_PROJECT}-nginx-1"
+install -d -m 755 /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
+printf '#!/bin/sh\ndocker stop %s >/dev/null 2>&1 || true\n' "${NGINX_CONTAINER}" > /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh
+printf '#!/bin/sh\ndocker start %s >/dev/null 2>&1 || true\n' "${NGINX_CONTAINER}" > /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
+chmod 755 /etc/letsencrypt/renewal-hooks/pre/stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/start-nginx.sh
+
+if [ ! -f "/etc/letsencrypt/live/${PUBLIC_DOMAIN}/fullchain.pem" ]; then
+  if [ -n "${CERTBOT_EMAIL}" ]; then
+    EMAIL_ARGS=(--email "${CERTBOT_EMAIL}")
+  else
+    EMAIL_ARGS=(--register-unsafely-without-email)
+  fi
+  docker stop "${NGINX_CONTAINER}" >/dev/null 2>&1 || true
+  certbot certonly --standalone --non-interactive --agree-tos "${EMAIL_ARGS[@]}" -d "${PUBLIC_DOMAIN}"
+fi
+
+sed "s/__PUBLIC_DOMAIN__/${PUBLIC_DOMAIN}/g" "${DEPLOY_DIR}/aws/nginx.aws.conf" > "${INFRA_DIR}/nginx/nginx.aws.generated.conf"
+
 echo "==> [2/5] Construindo e atualizando servicos base com Docker Compose..."
 docker compose \
   --project-name "${COMPOSE_PROJECT}" \
@@ -90,6 +132,8 @@ docker compose \
   -f "${AWS_OVERRIDE_FILE}" \
   up -d --build --wait --wait-timeout 180 \
   mosquitto redis recepcao backend frontend nginx
+
+docker exec "${NGINX_CONTAINER}" nginx -s reload
 
 echo "==> [3/5] Ativando servico de persistencia com validacao de schema e Stream Redis..."
 mkdir -p reports
