@@ -59,7 +59,7 @@ jobs:
     steps:
       - name: Conferir commit do INFRA e E2E
         id: gate
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           INPUT_SHA: ${{ inputs.infra_sha }}
         with:
@@ -168,7 +168,7 @@ jobs:
 
       - name: Autenticar na AWS via OIDC
         if: env.HAS_SSM == 'true'
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
