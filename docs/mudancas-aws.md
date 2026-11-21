@@ -53,7 +53,7 @@ Republicar/voltar versão: Actions → *Continuous Deployment (AWS EC2)* → Run
 
 | Bug | Correção |
 |---|---|
-| `aws ssm wait command-executed` desiste em ~100 s (com `\|\| true`) e o job falhava com o deploy ainda rodando | polling próprio até status final (teto 16 min, acima dos 900 s do comando) |
+| `aws ssm wait command-executed` desiste em ~100 s (com `\|\| true`) e o job falhava com o deploy ainda rodando | polling próprio até status final (até 15 min para a EC2 começar + 45 min de execução, com `executionTimeout` explícito) |
 | Sem secrets, push na main ficava verde sem publicar | job falha com erro dizendo o que configurar |
 | Smoke local em `127.0.0.1:80/dashboard` recebia 301 (o nginx vê o IP do gateway Docker) e passava sem testar o frontend | smoke via `docker exec` no nginx, HTTPS real com `--resolve` e `/health` |
 | `/health` externo caía no Next (nginx só tinha o frontend) | `location = /health` no nginx da AWS aponta para o backend |
