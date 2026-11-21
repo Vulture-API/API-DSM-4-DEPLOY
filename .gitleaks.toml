@@ -1,0 +1,10 @@
+# Regras padrão do gitleaks + valores falsos usados no CI e nos testes.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Segredos ficticios de CI/testes (nao sao credenciais)"
+regexes = [
+  '''ci-jwt-secret-com-mais-de-32-caracteres''',
+  '''0123456789abcdef0123456789abcdef''',
+]

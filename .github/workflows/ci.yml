@@ -1,0 +1,215 @@
+# CI do repositorio de deploy. Nao ha aplicacao para testar: valida o que vai
+# para producao (workflows, scripts da EC2, CloudFormation/IAM, override do
+# Compose e configuracao do Nginx). Roda sem credenciais da AWS e sem secrets.
+#
+# Gatilhos: PR para a main e chamada pelo deploy-aws.yml antes de publicar.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-deploy-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  INFRA_REPO: Vulture-API/API-DSM-4-INFRA
+  ACTIONLINT_VERSION: "1.7.7"
+  SHFMT_VERSION: "3.10.0"
+
+jobs:
+  workflows:
+    name: Workflows e scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Instalar ferramentas
+        run: |
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" actionlint
+          curl -fsSL -o "$RUNNER_TEMP/shfmt" "https://github.com/mvdan/sh/releases/download/v${SHFMT_VERSION}/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          chmod +x "$RUNNER_TEMP/shfmt"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          sudo apt-get update -q
+          sudo apt-get install -y -q bats
+
+      - name: actionlint (inclui shellcheck dos run)
+        run: actionlint -color
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      - name: Formatacao (shfmt)
+        run: shfmt -d -i 2 scripts/
+
+      - name: Testes do deploy-ec2.sh (bats)
+        run: bats test/
+
+  iac:
+    name: CloudFormation e IAM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: cfn-lint
+        run: |
+          pip install -q cfn-lint
+          cfn-lint aws/cloudformation-ec2-stack.yaml
+
+      - name: Politicas IAM validas e trust policy restrita
+        run: |
+          for f in aws/*.json; do jq -e . "$f" > /dev/null || { echo "::error file=$f::JSON invalido"; exit 1; }; done
+
+          # Somente main e environment production podem assumir a role de deploy.
+          SUBS=$(jq -r '.Statement[].Condition | (.StringEquals // {}), (.StringLike // {}) | ."token.actions.githubusercontent.com:sub" // empty | if type == "array" then .[] else . end' aws/iam-github-trust-policy.json)
+          [ -n "$SUBS" ] || { echo "::error::Trust policy sem condicao de sub."; exit 1; }
+          if grep -vE ':(ref:refs/heads/main|environment:production)$' <<<"$SUBS"; then
+            echo "::error file=aws/iam-github-trust-policy.json::Trust policy aceita sub alem de main/environment:production."
+            exit 1
+          fi
+          if grep -E 'githubusercontent.com:sub' -A6 aws/cloudformation-ec2-stack.yaml | grep -E 'repo:' | grep -vE ':(ref:refs/heads/main|environment:production)"$'; then
+            echo "::error file=aws/cloudformation-ec2-stack.yaml::Trust policy do CloudFormation aceita sub alem de main/environment:production."
+            exit 1
+          fi
+
+      - name: Checkov (CloudFormation e GitHub Actions)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: cloudformation,github_actions
+          quiet: true
+          # CKV_GHA_7: infra_sha no workflow_dispatch e intencional (validado no gate).
+          # CKV_AWS_260: porta 80 aberta e necessaria (redirect HTTPS e renovacao do certbot).
+          skip_check: CKV_GHA_7,CKV_AWS_260
+
+  compose-nginx:
+    name: Override do Compose e Nginx
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout do API-DSM-4-INFRA (main)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          ref: main
+          path: infra
+          persist-credentials: false
+
+      - name: Compose base + override de producao
+        working-directory: infra
+        run: |
+          cp ../aws/docker-compose.aws.yml docker-compose.aws.yml
+          # Valores ficticios: o objetivo e validar a composicao, nao conectar.
+          cp .env.example .env.ci
+          {
+            echo "DATABASE_URL=postgresql://ci:ci@localhost:5432/ci"
+            echo "JWT_SECRET=ci-jwt-secret-com-mais-de-32-caracteres"
+            echo "PERSIST_SOURCE_ID=ci"
+          } >> .env.ci
+          docker compose --env-file .env.ci -f docker-compose.yml -f docker-compose.aws.yml config --quiet
+          docker compose --env-file .env.ci -f docker-compose.yml -f docker-compose.aws.yml config --format json > "$RUNNER_TEMP/compose.json"
+
+          # Em producao so nginx (80/443) e MQTT ficam expostos fora do loopback.
+          jq -r '.services | to_entries[] | .key as $s | (.value.ports // [])[] | "\($s) \(.host_ip // "0.0.0.0"):\(.published)"' "$RUNNER_TEMP/compose.json" | tee "$RUNNER_TEMP/ports.txt"
+          if grep -vE '^(nginx|mosquitto) ' "$RUNNER_TEMP/ports.txt" | grep -v ' 127\.0\.0\.1:'; then
+            echo "::error::Servico exposto fora do loopback alem de nginx/mosquitto."
+            exit 1
+          fi
+
+      - name: nginx -t com a configuracao de producao
+        run: |
+          DOMAIN=ci.example.com
+          IMAGE=$(jq -r '.services.nginx.image' "$RUNNER_TEMP/compose.json")
+          mkdir -p "$RUNNER_TEMP/le/live/$DOMAIN"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 -subj "/CN=$DOMAIN" \
+            -keyout "$RUNNER_TEMP/le/live/$DOMAIN/privkey.pem" \
+            -out "$RUNNER_TEMP/le/live/$DOMAIN/fullchain.pem" 2> /dev/null
+          sed "s/__PUBLIC_DOMAIN__/$DOMAIN/g" aws/nginx.aws.conf > "$RUNNER_TEMP/nginx.conf"
+          if grep -q '__PUBLIC_DOMAIN__' "$RUNNER_TEMP/nginx.conf"; then echo "::error::Placeholder nao substituido."; exit 1; fi
+          docker run --rm \
+            --add-host frontend:127.0.0.1 --add-host backend:127.0.0.1 \
+            -v "$RUNNER_TEMP/nginx.conf:/etc/nginx/nginx.conf:ro" \
+            -v "$RUNNER_TEMP/le:/etc/letsencrypt:ro" \
+            "$IMAGE" nginx -t
+
+  secrets:
+    name: Segredos no repositorio
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: gitleaks (arquivos do commit)
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" ghcr.io/gitleaks/gitleaks:v8.24.2 \
+            dir /repo --redact --no-banner --exit-code 1
+
+  comment:
+    name: Comentar resultado no PR
+    needs: [workflows, iac, compose-nginx, secrets]
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Criar ou atualizar o comentario do CI
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const marker = '<!-- vulture-ci-report -->';
+            const needs = JSON.parse(process.env.RESULTS);
+            const nomes = {
+              workflows: 'Workflows e scripts',
+              iac: 'CloudFormation e IAM',
+              'compose-nginx': 'Override do Compose e Nginx',
+              secrets: 'Segredos no repositorio',
+            };
+            const ok = Object.values(needs).every((j) => j.result === 'success');
+            const body = [
+              marker,
+              `${ok ? '✅' : '❌'} **Pipeline de CI: ${ok ? 'aprovado' : 'reprovado'}**`,
+              '',
+              ...Object.entries(needs).map(([id, j]) => `- ${nomes[id] || id}: \`${j.result}\``),
+              `- Commit: \`${context.payload.pull_request.head.sha.substring(0, 7)}\``,
+              `- [Ver execução completa](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.body?.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }

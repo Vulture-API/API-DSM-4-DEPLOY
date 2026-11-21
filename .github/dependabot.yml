@@ -1,0 +1,12 @@
+# Mantem as actions dos workflows atualizadas (um PR agrupado por mes).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
