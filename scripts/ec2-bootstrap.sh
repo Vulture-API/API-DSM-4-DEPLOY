@@ -10,8 +10,6 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT_LOCAL="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || true)"
 VULTURE_BASE_DIR="${VULTURE_BASE_DIR:-/opt/vulture}"
 INFRA_DIR="${VULTURE_BASE_DIR}/API-DSM-4-INFRA"
 DEPLOY_DIR="${VULTURE_BASE_DIR}/API-DSM-4-DEPLOY"
@@ -29,7 +27,7 @@ if ! swapon --show | grep -q '/swapfile'; then
   fi
   swapon /swapfile
   if ! grep -q '^/swapfile ' /etc/fstab; then
-    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo '/swapfile none swap sw 0 0' >>/etc/fstab
   fi
   echo "Swap de 2 GB ativado."
 else
@@ -50,7 +48,7 @@ if ! command -v docker >/dev/null 2>&1; then
   fi
   # shellcheck disable=SC1091
   . /etc/os-release
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" >/etc/apt/sources.list.d/docker.list
   apt-get update -qq
   apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 else
@@ -59,7 +57,7 @@ fi
 
 mkdir -p /etc/docker
 if [ ! -f /etc/docker/daemon.json ]; then
-  cat <<'EOF' > /etc/docker/daemon.json
+  cat <<'EOF' >/etc/docker/daemon.json
 {
   "log-driver": "json-file",
   "log-opts": {
@@ -100,20 +98,17 @@ else
   git -C "${INFRA_DIR}" submodule update --init --recursive
 fi
 
-if [ -f "${REPO_ROOT_LOCAL}/aws/docker-compose.aws.yml" ] && [ -f "${SCRIPT_DIR}/deploy-ec2.sh" ]; then
-  COMPOSE_AWS_SRC="${REPO_ROOT_LOCAL}/aws/docker-compose.aws.yml"
-  DEPLOY_SH_SRC="${SCRIPT_DIR}/deploy-ec2.sh"
+# O workflow de deploy atualiza este clone a cada execucao: ele precisa existir
+# mesmo quando o bootstrap roda a partir de uma copia local do repositorio.
+if [ ! -d "${DEPLOY_DIR}/.git" ]; then
+  git clone --branch "${DEPLOY_BRANCH}" "${DEPLOY_REPO_URL}" "${DEPLOY_DIR}"
 else
-  if [ ! -d "${DEPLOY_DIR}/.git" ]; then
-    git clone --branch "${DEPLOY_BRANCH}" "${DEPLOY_REPO_URL}" "${DEPLOY_DIR}"
-  else
-    git -C "${DEPLOY_DIR}" fetch origin "${DEPLOY_BRANCH}"
-    git -C "${DEPLOY_DIR}" checkout "${DEPLOY_BRANCH}"
-    git -C "${DEPLOY_DIR}" reset --hard "origin/${DEPLOY_BRANCH}"
-  fi
-  COMPOSE_AWS_SRC="${DEPLOY_DIR}/aws/docker-compose.aws.yml"
-  DEPLOY_SH_SRC="${DEPLOY_DIR}/scripts/deploy-ec2.sh"
+  git -C "${DEPLOY_DIR}" fetch origin "${DEPLOY_BRANCH}"
+  git -C "${DEPLOY_DIR}" checkout "${DEPLOY_BRANCH}"
+  git -C "${DEPLOY_DIR}" reset --hard "origin/${DEPLOY_BRANCH}"
 fi
+COMPOSE_AWS_SRC="${DEPLOY_DIR}/aws/docker-compose.aws.yml"
+DEPLOY_SH_SRC="${DEPLOY_DIR}/scripts/deploy-ec2.sh"
 
 cp "${COMPOSE_AWS_SRC}" "${VULTURE_BASE_DIR}/scripts/docker-compose.aws.yml"
 cp "${COMPOSE_AWS_SRC}" "${INFRA_DIR}/docker-compose.aws.yml"

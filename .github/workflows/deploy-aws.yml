@@ -1,148 +1,227 @@
+# Deploy continuo na AWS (EC2 + Docker Compose).
+#
+# Fluxo: CI deste repo -> gate (o commit do INFRA precisa estar na main e com o
+# E2E verde) -> deploy via SSM (OIDC) no environment production -> smoke externo.
+#
+# Gatilhos:
+#   - push na main deste repo (publica a ponta da main do INFRA, se aprovada);
+#   - workflow_dispatch: o INFRA chama ao fim do E2E verde na main, passando
+#     infra_sha; tambem serve para republicar/voltar uma versao manualmente.
 name: Continuous Deployment (AWS EC2)
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
-      environment:
-        description: Ambiente de destino na AWS
+      infra_sha:
+        description: Commit do API-DSM-4-INFRA a publicar (vazio = ponta da main)
         required: false
-        default: production
-        type: choice
-        options:
-          - production
-          - staging
+        default: ""
+        type: string
       skip_smoke_test:
-        description: Pular smoke test externo apos o deploy
+        description: Pular o smoke test externo apos o deploy
         required: false
         default: false
         type: boolean
 
+# Um deploy por vez; o seguinte espera (nunca cancela um deploy em andamento).
 concurrency:
   group: aws-production-deployment
   cancel-in-progress: false
 
 permissions:
-  id-token: write
   contents: read
 
+env:
+  INFRA_REPO: Vulture-API/API-DSM-4-INFRA
+  # Jobs do E2E do INFRA que precisam estar verdes no commit publicado.
+  INFRA_REQUIRED_CHECKS: '["Ambiente completo + E2E", "Suítes fixadas de recepção, tratamento e BANCO"]'
+
 jobs:
-  pre-flight:
-    name: Validacao de Pre-requisitos AWS
-    runs-on: ubuntu-latest
+  ci:
+    name: CI do repositorio de deploy
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      pull-requests: write
+
+  gate:
+    name: Versao do INFRA aprovada no E2E
+    needs: ci
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
     outputs:
-      ssm_configured: ${{ steps.check.outputs.ssm_configured }}
-      ssh_configured: ${{ steps.check.outputs.ssh_configured }}
-      external_smoke_configured: ${{ steps.check.outputs.external_smoke_configured }}
+      infra_sha: ${{ steps.gate.outputs.infra_sha }}
     steps:
-      - name: Verificar secrets e modo de deploy configurado
-        id: check
+      - name: Conferir commit do INFRA e E2E
+        id: gate
+        uses: actions/github-script@v8
         env:
-          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-          AWS_EC2_INSTANCE_ID: ${{ secrets.AWS_EC2_INSTANCE_ID }}
-          EC2_SSH_HOST: ${{ secrets.EC2_SSH_HOST }}
-          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          PROD_API_URL: ${{ secrets.PROD_API_URL }}
-          PROD_FRONT_URL: ${{ secrets.PROD_FRONT_URL }}
-        run: |
-          SSM_READY="false"
-          SSH_READY="false"
-          SMOKE_READY="false"
+          INPUT_SHA: ${{ inputs.infra_sha }}
+        with:
+          script: |
+            const [owner, repo] = process.env.INFRA_REPO.split('/');
+            const required = JSON.parse(process.env.INFRA_REQUIRED_CHECKS);
+            const input = (process.env.INPUT_SHA || '').trim().toLowerCase();
 
-          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_EC2_INSTANCE_ID" ]; then
-            SSM_READY="true"
-            echo "Modo selecionado: AWS OIDC + Systems Manager (SSM Run Command)."
-          elif [ -n "$EC2_SSH_HOST" ] && [ -n "$EC2_SSH_PRIVATE_KEY" ]; then
-            SSH_READY="true"
-            echo "Modo selecionado: Fallback via SSH direto na EC2."
-          else
-            echo "::notice::Credenciais AWS ainda nao configuradas nos Secrets do repositorio API-DSM-4-DEPLOY. Configure AWS_ROLE_ARN e AWS_EC2_INSTANCE_ID (recomendado via OIDC/SSM) ou EC2_SSH_HOST e EC2_SSH_PRIVATE_KEY (fallback SSH)."
-          fi
+            // O INFRA e publico: se o token deste repo nao puder ler la, le sem token.
+            const api = async (route, params = {}) => {
+              try {
+                return (await github.request(route, { owner, repo, ...params })).data;
+              } catch (erro) {
+                if (![403, 404].includes(erro.status)) throw erro;
+                const path = route.replace(/^GET /, '').replace(/{(\w+)}/g, (_, k) => ({ owner, repo, ...params })[k]);
+                const query = new URLSearchParams(Object.entries(params).filter(([k]) => !route.includes(`{${k}}`))).toString();
+                const res = await fetch(`https://api.github.com${path}${query ? `?${query}` : ''}`, {
+                  headers: { accept: 'application/vnd.github+json', 'user-agent': 'vulture-deploy-gate' },
+                });
+                if (!res.ok) throw new Error(`GitHub API ${res.status} em ${path}`);
+                return res.json();
+              }
+            };
 
-          if [ -n "$PROD_API_URL" ] || [ -n "$PROD_FRONT_URL" ]; then
-            SMOKE_READY="true"
-          fi
+            if (input && !/^[0-9a-f]{7,40}$/.test(input)) {
+              core.setFailed(`infra_sha invalido: "${input}".`);
+              return;
+            }
 
-          echo "ssm_configured=${SSM_READY}" >> "$GITHUB_OUTPUT"
-          echo "ssh_configured=${SSH_READY}" >> "$GITHUB_OUTPUT"
-          echo "external_smoke_configured=${SMOKE_READY}" >> "$GITHUB_OUTPUT"
+            const main = await api('GET /repos/{owner}/{repo}/branches/{branch}', { branch: 'main' });
+            let sha = main.commit.sha;
+            if (input) {
+              sha = (await api('GET /repos/{owner}/{repo}/commits/{ref}', { ref: input })).sha;
+              // "behind" ou "identical": o commit pedido ja esta na main.
+              const cmp = await api('GET /repos/{owner}/{repo}/compare/{basehead}', { basehead: `main...${sha}` });
+              if (!['behind', 'identical'].includes(cmp.status)) {
+                core.setFailed(`O commit ${sha.slice(0, 7)} nao esta na main do INFRA (status: ${cmp.status}).`);
+                return;
+              }
+            }
 
-  deploy-ec2-ssm:
-    name: Deploy EC2 via AWS SSM (OIDC)
-    needs: pre-flight
-    if: ${{ !cancelled() && needs.pre-flight.outputs.ssm_configured == 'true' }}
-    runs-on: ubuntu-latest
+            const { check_runs: runs } = await api('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+              ref: sha, per_page: 100,
+            });
+            const faltando = [];
+            for (const name of required) {
+              // Mais recente primeiro: uma reexecucao verde vale sobre a falha anterior.
+              const run = runs
+                .filter((r) => r.name === name)
+                .sort((a, b) => new Date(b.started_at) - new Date(a.started_at))[0];
+              if (!run) faltando.push(`${name}: nao executado`);
+              else if (run.status !== 'completed') faltando.push(`${name}: ainda em execucao`);
+              else if (run.conclusion !== 'success') faltando.push(`${name}: ${run.conclusion}`);
+            }
+            if (faltando.length) {
+              core.setFailed(`INFRA ${sha.slice(0, 7)} sem E2E verde -> ${faltando.join('; ')}`);
+              return;
+            }
+
+            core.setOutput('infra_sha', sha);
+            await core.summary
+              .addHeading('Versao aprovada para deploy', 3)
+              .addRaw(`INFRA ${sha.slice(0, 7)} com ${required.join(' e ')} verdes.`)
+              .write();
+
+  deploy:
+    name: Deploy na EC2
+    needs: gate
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
+    # O sub do token OIDC passa a ser environment:production, o unico (com a
+    # main) aceito pela trust policy da role na AWS.
+    environment:
+      name: production
+      url: ${{ vars.PUBLIC_DOMAIN && format('https://{0}/dashboard', vars.PUBLIC_DOMAIN) || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      INFRA_SHA: ${{ needs.gate.outputs.infra_sha }}
+      DEPLOY_SHA: ${{ github.sha }}
+      PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+      HAS_SSM: ${{ secrets.AWS_ROLE_ARN != '' && secrets.AWS_EC2_INSTANCE_ID != '' }}
+      HAS_SSH: ${{ secrets.EC2_SSH_HOST != '' && secrets.EC2_SSH_PRIVATE_KEY != '' }}
     steps:
+      - name: Validar configuracao
+        run: |
+          if [ "$HAS_SSM" != "true" ] && [ "$HAS_SSH" != "true" ]; then
+            echo "::error::Sem credenciais de deploy. Configure AWS_ROLE_ARN e AWS_EC2_INSTANCE_ID (OIDC/SSM) ou EC2_SSH_HOST e EC2_SSH_PRIVATE_KEY no environment production."
+            exit 1
+          fi
+          if [ -n "$PUBLIC_DOMAIN" ] && ! [[ "$PUBLIC_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$ ]]; then
+            echo "::error::vars.PUBLIC_DOMAIN invalido: $PUBLIC_DOMAIN"
+            exit 1
+          fi
+          [[ "$INFRA_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::INFRA_SHA ausente ou invalido."; exit 1; }
+
+          # Comando executado na EC2: atualiza este repo no commit validado e roda o deploy.
+          # Os valores ja foram validados acima (hex e hostname), sem risco de injecao.
+          CMD="set -euo pipefail"
+          CMD="$CMD; git -C /opt/vulture/API-DSM-4-DEPLOY fetch -q origin main"
+          CMD="$CMD; git -C /opt/vulture/API-DSM-4-DEPLOY reset -q --hard $DEPLOY_SHA"
+          CMD="$CMD; install -m 750 /opt/vulture/API-DSM-4-DEPLOY/scripts/deploy-ec2.sh /opt/vulture/scripts/deploy-ec2.sh"
+          CMD="$CMD; INFRA_SHA=$INFRA_SHA PUBLIC_DOMAIN=$PUBLIC_DOMAIN /opt/vulture/scripts/deploy-ec2.sh"
+          echo "REMOTE_CMD=$CMD" >> "$GITHUB_ENV"
+
       - name: Autenticar na AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        if: env.HAS_SSM == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
           role-session-name: GitHubActions-VultureDeploy
 
-      - name: Disparar deploy na EC2 via AWS SSM Run Command
-        id: send_ssm
+      - name: Deploy via SSM Run Command
+        if: env.HAS_SSM == 'true'
         env:
           INSTANCE_ID: ${{ secrets.AWS_EC2_INSTANCE_ID }}
-          TARGET_ENV: ${{ inputs.environment || 'production' }}
         run: |
-          echo "Enviando comando de deploy para a instancia ${INSTANCE_ID} (ambiente: ${TARGET_ENV})..."
+          PARAMS=$(jq -cn --arg c "sudo bash -c '$REMOTE_CMD'" '{commands: [$c]}')
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${INSTANCE_ID}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "GitHub Actions API-DSM-4-DEPLOY (${GITHUB_SHA::7})" \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "API-DSM-4-DEPLOY ${DEPLOY_SHA::7} / INFRA ${INFRA_SHA::7}" \
             --timeout-seconds 900 \
-            --parameters 'commands=["sudo git -C /opt/vulture/API-DSM-4-DEPLOY fetch -q origin main && sudo git -C /opt/vulture/API-DSM-4-DEPLOY reset -q --hard origin/main && sudo install -m 750 /opt/vulture/API-DSM-4-DEPLOY/scripts/deploy-ec2.sh /opt/vulture/scripts/deploy-ec2.sh && sudo PUBLIC_DOMAIN=${{ vars.PUBLIC_DOMAIN }} /opt/vulture/scripts/deploy-ec2.sh"]' \
-            --query "Command.CommandId" \
-            --output text)
-          echo "CommandId: ${COMMAND_ID}"
-          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+            --parameters "$PARAMS" \
+            --query Command.CommandId --output text)
+          echo "CommandId: $COMMAND_ID"
 
-      - name: Aguardar execucao e coletar logs do SSM
-        env:
-          INSTANCE_ID: ${{ secrets.AWS_EC2_INSTANCE_ID }}
-          COMMAND_ID: ${{ steps.send_ssm.outputs.command_id }}
-        run: |
-          echo "Aguardando conclusao do comando ${COMMAND_ID}..."
-          aws ssm wait command-executed \
-            --command-id "${COMMAND_ID}" \
-            --instance-id "${INSTANCE_ID}" || true
+          # O waiter da AWS CLI desiste em ~100 s; o build leva bem mais. Polling
+          # proprio ate um status final, com teto acima do timeout do comando.
+          STATUS=Pending
+          for _ in $(seq 1 96); do
+            sleep 10
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Pending|InProgress|Delayed|Cancelling) echo "Status: $STATUS" ;;
+              *) break ;;
+            esac
+          done
 
-          INVOCATION_JSON=$(aws ssm get-command-invocation \
-            --command-id "${COMMAND_ID}" \
-            --instance-id "${INSTANCE_ID}" \
-            --output json)
-
-          STATUS=$(echo "${INVOCATION_JSON}" | jq -r '.Status')
-          RESPONSE_CODE=$(echo "${INVOCATION_JSON}" | jq -r '.ResponseCode')
-
-          echo "=== Saida Padrao (EC2) ==="
-          echo "${INVOCATION_JSON}" | jq -r '.StandardOutputContent // ""'
-
-          STDERR_OUT=$(echo "${INVOCATION_JSON}" | jq -r '.StandardErrorContent // ""')
-          if [ -n "${STDERR_OUT}" ]; then
-            echo "=== Saida de Erro (EC2) ==="
-            echo "${STDERR_OUT}"
+          INVOCATION=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --output json)
+          echo "::group::Saida do deploy na EC2"
+          jq -r '.StandardOutputContent // ""' <<<"$INVOCATION"
+          echo "::endgroup::"
+          STDERR_OUT=$(jq -r '.StandardErrorContent // ""' <<<"$INVOCATION")
+          if [ -n "$STDERR_OUT" ]; then
+            echo "::group::Saida de erro"
+            echo "$STDERR_OUT"
+            echo "::endgroup::"
           fi
 
-          echo "Status SSM: ${STATUS} (codigo de saida: ${RESPONSE_CODE})"
-          if [ "${STATUS}" != "Success" ]; then
-            echo "::error::Falha no deploy via SSM (status: ${STATUS}, exit code: ${RESPONSE_CODE})."
+          CODE=$(jq -r '.ResponseCode' <<<"$INVOCATION")
+          echo "Status SSM: $STATUS (codigo de saida: $CODE)"
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deploy via SSM falhou (status: $STATUS, codigo: $CODE). O script tenta voltar a versao anterior; confira a saida acima."
             exit 1
           fi
 
-  deploy-ec2-ssh:
-    name: Deploy EC2 via SSH (Alternativo)
-    needs: pre-flight
-    if: ${{ !cancelled() && needs.pre-flight.outputs.ssm_configured != 'true' && needs.pre-flight.outputs.ssh_configured == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Executar script de deploy na EC2 via SSH
+      - name: Deploy via SSH (alternativo)
+        if: env.HAS_SSM != 'true' && env.HAS_SSH == 'true'
         env:
           SSH_HOST: ${{ secrets.EC2_SSH_HOST }}
           SSH_USER: ${{ secrets.EC2_SSH_USER || 'ubuntu' }}
@@ -152,61 +231,67 @@ jobs:
         run: |
           install -d -m 700 ~/.ssh
           trap 'rm -f ~/.ssh/deploy_key' EXIT
-          printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
-          if [ -n "${SSH_KNOWN_HOSTS}" ]; then
-            printf '%s\n' "${SSH_KNOWN_HOSTS}" > ~/.ssh/known_hosts
-            chmod 644 ~/.ssh/known_hosts
-            STRICT_OPT="-o StrictHostKeyChecking=yes"
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            STRICT=yes
           else
-            STRICT_OPT="-o StrictHostKeyChecking=accept-new"
+            echo "::warning::EC2_SSH_KNOWN_HOSTS nao configurado: a chave do host sera aceita no primeiro acesso."
+            STRICT=accept-new
           fi
 
-          ssh -i ~/.ssh/deploy_key -p "${SSH_PORT}" ${STRICT_OPT} \
-            "${SSH_USER}@${SSH_HOST}" \
-            "sudo git -C /opt/vulture/API-DSM-4-DEPLOY fetch -q origin main && sudo git -C /opt/vulture/API-DSM-4-DEPLOY reset -q --hard origin/main && sudo install -m 750 /opt/vulture/API-DSM-4-DEPLOY/scripts/deploy-ec2.sh /opt/vulture/scripts/deploy-ec2.sh && sudo PUBLIC_DOMAIN=${{ vars.PUBLIC_DOMAIN }} /opt/vulture/scripts/deploy-ec2.sh"
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" -o StrictHostKeyChecking="$STRICT" \
+            "$SSH_USER@$SSH_HOST" "sudo bash -c '$REMOTE_CMD'"
 
-  smoke-test-external:
-    name: Smoke Test Externo Pos-Deploy
-    needs: [pre-flight, deploy-ec2-ssm, deploy-ec2-ssh]
-    if: >-
-      !cancelled() &&
-      (needs.deploy-ec2-ssm.result == 'success' || needs.deploy-ec2-ssh.result == 'success') &&
-      needs.pre-flight.outputs.external_smoke_configured == 'true' &&
-      inputs.skip_smoke_test != true
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Validar URLs publicas em producao
-        env:
-          PROD_API_URL: ${{ secrets.PROD_API_URL }}
-          PROD_FRONT_URL: ${{ secrets.PROD_FRONT_URL }}
+      - name: Resumo
+        if: always()
         run: |
-          check_url() {
-            local label="$1"
-            local url="$2"
-            local max_code="$3"
-            local status="000"
+          {
+            echo "### Deploy ${{ job.status == 'success' && 'concluido' || 'falhou' }}"
+            echo "- INFRA: \`${INFRA_SHA::7}\`"
+            echo "- API-DSM-4-DEPLOY: \`${DEPLOY_SHA::7}\`"
+            echo "- Modo: $([ "$HAS_SSM" = true ] && echo SSM || echo SSH)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  smoke:
+    name: Smoke test externo
+    needs: deploy
+    if: ${{ !inputs.skip_smoke_test }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PUBLIC_DOMAIN: ${{ vars.PUBLIC_DOMAIN }}
+      PROD_FRONT_URL: ${{ secrets.PROD_FRONT_URL }}
+      PROD_API_URL: ${{ secrets.PROD_API_URL }}
+    steps:
+      - name: Validar URLs publicas
+        run: |
+          FRONT="${PROD_FRONT_URL:-${PUBLIC_DOMAIN:+https://$PUBLIC_DOMAIN/dashboard}}"
+          API="${PROD_API_URL:-${PUBLIC_DOMAIN:+https://$PUBLIC_DOMAIN}}"
+          if [ -z "$FRONT" ] && [ -z "$API" ]; then
+            echo "::error::Defina vars.PUBLIC_DOMAIN (ou os secrets PROD_FRONT_URL/PROD_API_URL) para o smoke test."
+            exit 1
+          fi
+
+          check() {
+            local label="$1" url="$2" status=000
             for attempt in $(seq 1 10); do
-              status=$(curl -s -o /dev/null -w "%{http_code}" "${url}" || true)
-              if [ "${status}" -ge 200 ] && [ "${status}" -lt "${max_code}" ]; then
-                echo "[OK] ${label} (${url}) -> HTTP ${status} (tentativa ${attempt})."
+              # -L: o /dashboard pode redirecionar para o login.
+              status=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 15 "$url" || true)
+              if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+                echo "[OK] $label ($url) -> HTTP $status (tentativa $attempt)."
                 return 0
               fi
-              echo "[Aguardando] ${label} -> HTTP ${status} (tentativa ${attempt}/10)..."
+              echo "[Aguardando] $label -> HTTP $status (tentativa $attempt/10)..."
               sleep 10
             done
-
-            echo "::error::Falha no Smoke Test externo de ${label} (${url}): HTTP ${status}."
+            echo "::error::Smoke test externo falhou em $label ($url): HTTP $status."
             return 1
           }
 
-          if [ -n "${PROD_API_URL}" ]; then
-            check_url "API /health" "${PROD_API_URL%/}/health" 300
-          fi
-
-          if [ -n "${PROD_FRONT_URL}" ]; then
-            check_url "Portal Web" "${PROD_FRONT_URL}" 500
-          fi
+          FAIL=0
+          [ -z "$API" ] || check "API /health" "${API%/}/health" || FAIL=1
+          [ -z "$FRONT" ] || check "Portal web" "$FRONT" || FAIL=1
+          exit "$FAIL"

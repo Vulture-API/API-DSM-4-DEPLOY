@@ -10,12 +10,12 @@
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": [
-            "repo:Vulture-API/API-DSM-4-DEPLOY:*",
-            "repo:Vulture-API@324885289/API-DSM-4-DEPLOY@1462724427:*"
+            "repo:Vulture-API/API-DSM-4-DEPLOY:ref:refs/heads/main",
+            "repo:Vulture-API/API-DSM-4-DEPLOY:environment:production",
+            "repo:Vulture-API@324885289/API-DSM-4-DEPLOY@1462724427:ref:refs/heads/main",
+            "repo:Vulture-API@324885289/API-DSM-4-DEPLOY@1462724427:environment:production"
           ]
         }
       }
