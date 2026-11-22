@@ -214,15 +214,11 @@ Resources:
                 - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              # Somente a main e o environment production do repo de deploy
-              # (PRs e outras branches nao assumem a role de producao).
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
                 token.actions.githubusercontent.com:sub:
-                  - !Sub "repo:${GitHubOrg}/${GitHubDeployRepo}:ref:refs/heads/main"
                   - !Sub "repo:${GitHubOrg}/${GitHubDeployRepo}:environment:production"
-                  - !Sub "repo:${GitHubOrg}@*/${GitHubDeployRepo}@*:ref:refs/heads/main"
                   - !Sub "repo:${GitHubOrg}@*/${GitHubDeployRepo}@*:environment:production"
       Policies:
         - PolicyName: !Sub "${EnvironmentName}-ssm-deploy-policy"

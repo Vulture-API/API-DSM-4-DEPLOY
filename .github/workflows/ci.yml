@@ -77,15 +77,14 @@ jobs:
         run: |
           for f in aws/*.json; do jq -e . "$f" > /dev/null || { echo "::error file=$f::JSON invalido"; exit 1; }; done
 
-          # Somente main e environment production podem assumir a role de deploy.
           SUBS=$(jq -r '.Statement[].Condition | (.StringEquals // {}), (.StringLike // {}) | ."token.actions.githubusercontent.com:sub" // empty | if type == "array" then .[] else . end' aws/iam-github-trust-policy.json)
           [ -n "$SUBS" ] || { echo "::error::Trust policy sem condicao de sub."; exit 1; }
-          if grep -vE ':(ref:refs/heads/main|environment:production)$' <<<"$SUBS"; then
-            echo "::error file=aws/iam-github-trust-policy.json::Trust policy aceita sub alem de main/environment:production."
+          if grep -vE ':environment:production$' <<<"$SUBS"; then
+            echo "::error file=aws/iam-github-trust-policy.json::Trust policy aceita sub alem de environment:production."
             exit 1
           fi
-          if grep -E 'githubusercontent.com:sub' -A6 aws/cloudformation-ec2-stack.yaml | grep -E 'repo:' | grep -vE ':(ref:refs/heads/main|environment:production)"$'; then
-            echo "::error file=aws/cloudformation-ec2-stack.yaml::Trust policy do CloudFormation aceita sub alem de main/environment:production."
+          if grep -E 'githubusercontent.com:sub' -A6 aws/cloudformation-ec2-stack.yaml | grep -E 'repo:' | grep -vE ':environment:production"$'; then
+            echo "::error file=aws/cloudformation-ec2-stack.yaml::Trust policy do CloudFormation aceita sub alem de environment:production."
             exit 1
           fi
 

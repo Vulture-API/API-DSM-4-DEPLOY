@@ -13,9 +13,11 @@ x-aws-logging: &aws-logging
 
 services:
   redis:
+    restart: unless-stopped
     logging: *aws-logging
 
   mosquitto:
+    restart: unless-stopped
     ports: !override
       - "0.0.0.0:${MQTT_PORT:-1883}:1883"
     logging: *aws-logging

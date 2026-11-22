@@ -128,8 +128,48 @@ ensure_certificate() {
   sed "s/__PUBLIC_DOMAIN__/${domain}/g" "${DEPLOY_DIR}/aws/nginx.aws.conf" >"${INFRA_DIR}/nginx/nginx.aws.generated.conf"
 }
 
+apply_migrations() {
+  local manifest="${INFRA_DIR}/services/API-DSM-4-BANCO/migrations/manifest.txt"
+  [ -f "${manifest}" ] || return 0
+  log "Aplicando migrations idempotentes de ${manifest}..."
+  compose run --rm --no-deps \
+    -v "${INFRA_DIR}/services/API-DSM-4-BANCO:/banco:ro" \
+    backend node -e '
+      const fs = require("node:fs");
+      const pg = require("pg");
+      const items = fs.readFileSync("/banco/migrations/manifest.txt", "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"));
+      (async () => {
+        const client = new pg.Client({
+          connectionString: process.env.DATABASE_URL,
+          connectionTimeoutMillis: 20000,
+        });
+        await client.connect();
+        try {
+          for (const name of items) {
+            const sql = fs.readFileSync("/banco/migrations/" + name + ".sql", "utf8");
+            await client.query(sql);
+            console.log("[OK] Migration " + name);
+          }
+        } finally {
+          await client.end().catch(() => {});
+        }
+      })().catch((err) => {
+        console.error("Erro na migration:", err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      });
+    '
+}
+
 start_services() {
-  compose up -d --build --wait --wait-timeout 180 "${BASE_SERVICES[@]}"
+  local svc
+  for svc in recepcao backend frontend; do
+    compose build "${svc}"
+  done
+  apply_migrations
+  compose up -d --wait --wait-timeout 180 "${BASE_SERVICES[@]}"
   docker exec "${NGINX_CONTAINER}" nginx -s reload
   mkdir -p reports
   python3 scripts/telemetry.py activate \
